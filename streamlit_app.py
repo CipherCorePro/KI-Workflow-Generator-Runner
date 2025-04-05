@@ -25,7 +25,7 @@ import traceback
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 # Standard-Modell für die Generierung
-DEFAULT_MODEL_ID = "gemini-2.0-pro-exp-02-05"
+DEFAULT_MODEL_ID = "gemini-2.0-flash-thinking-exp-01-21"
 # Spezielle Namen und Dateien für den Generator-Workflow
 GENERATOR_WORKFLOW_NAME = "Dynamischer Workflow Generator"
 GENERATOR_CONFIG_FILE = "generator_agent_config.json"
