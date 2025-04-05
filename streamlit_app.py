@@ -3,6 +3,8 @@
 Dieses Script implementiert einen KI-Workflow-Generator und -Runner mit Streamlit.
 Es verwendet unter anderem das strukturierte Pattern Matching (PEP 634-636) und den Union-Typ-Operator (PEP 604).
 Außerdem wird großer Wert auf klare, einfache und lesbare Strukturen gelegt.
+Dieses Skript beinhaltet zusätzlich eine RPM-Funktion, die es erlaubt, die Anfragen an das Gemini Modell
+auf eine bestimmte Anzahl pro Minute zu begrenzen.
 """
 
 # Importiere alle notwendigen Bibliotheken
@@ -19,16 +21,70 @@ import datetime
 import re
 import zipfile
 import traceback
+import time  # Wird für die RPM-Implementierung benötigt
 
 # --- Konstanten ---
 # Lade API-Key aus .env Datei (falls vorhanden)
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 # Standard-Modell für die Generierung
-DEFAULT_MODEL_ID = "gemini-2.0-flash-thinking-exp-01-21"
+DEFAULT_MODEL_ID = "gemini-2.0-flash-thinking-exp-01-21"  # Alternativ: "gemini-2.0-pro-exp-02-05"
 # Spezielle Namen und Dateien für den Generator-Workflow
 GENERATOR_WORKFLOW_NAME = "Dynamischer Workflow Generator"
 GENERATOR_CONFIG_FILE = "generator_agent_config.json"
+
+# --- RPM Funktionalität ---
+def rpm_limiter(func: Callable) -> Callable:
+    """
+    Decorator, der sicherstellt, dass die dekorierte Funktion nicht öfter als eine bestimmte Anzahl
+    von Aufrufen pro Minute ausgeführt wird.
+    
+    Der maximale Wert wird in st.session_state['rpm_limit'] gespeichert.
+    Falls das Limit erreicht wird, wartet die Funktion, bis 60 Sekunden seit dem letzten Reset vergangen sind.
+    """
+    def wrapper(*args, **kwargs):
+        # Hole den aktuellen RPM-Limit-Wert; Standard ist 30 Anfragen pro Minute.
+        rpm_limit = st.session_state.get("rpm_limit", 30)
+        current_time = time.time()
+        # Initialisiere Timer und Aufrufzähler, falls sie noch nicht existieren.
+        if "rpm_last_reset" not in st.session_state:
+            st.session_state.rpm_last_reset = current_time
+            st.session_state.rpm_calls = 0
+
+        # Falls seit dem letzten Reset mehr als 60 Sekunden vergangen sind, setze den Zähler zurück.
+        if current_time - st.session_state.rpm_last_reset >= 60:
+            st.session_state.rpm_last_reset = current_time
+            st.session_state.rpm_calls = 0
+
+        # Wenn das Limit erreicht wurde, berechne die Wartezeit und pausiere.
+        if st.session_state.rpm_calls >= rpm_limit:
+            wait_time = 60 - (current_time - st.session_state.rpm_last_reset)
+            st.warning(f"RPM Limit erreicht. Warte {wait_time:.2f} Sekunden, bis neue Anfragen gesendet werden können.")
+            time.sleep(wait_time)
+            st.session_state.rpm_last_reset = time.time()
+            st.session_state.rpm_calls = 0
+
+        # Erhöhe den Zähler für die aktuellen Anfragen
+        st.session_state.rpm_calls += 1
+        return func(*args, **kwargs)
+    return wrapper
+
+@rpm_limiter
+def limited_generate_content(client: genai.Client, model: str, contents: List[Part], config: GenerateContentConfig) -> Any:
+    """
+    Wrapper um den API-Aufruf an das Gemini Modell zu rate-limiten.
+    Verwendet den in st.session_state gesetzten RPM-Wert.
+    
+    Parameter:
+      - client: Instanz des genai.Client.
+      - model: Modellbezeichnung als String.
+      - contents: Liste von Part-Objekten, die den Input darstellen.
+      - config: Konfiguration für die Generierung (z.B. Temperatur).
+    
+    Rückgabe:
+      - Antwort des API-Aufrufs.
+    """
+    return client.models.generate_content(model=model, contents=contents, config=config)
 
 # --- Hilfsfunktionen (Tools für Agenten) ---
 def get_current_datetime() -> str:
@@ -43,32 +99,27 @@ def simple_calculator(expression: str) -> str:
     um Code-Injection-Risiken zu vermeiden.
     """
     try:
-        # Einfache Validierung der erlaubten Zeichen
         allowed_chars = "0123456789+-*/.() "
         if all(c in allowed_chars for c in expression):
-            # !! ACHTUNG: eval() ist unsicher bei unkontrollierter Eingabe !!
             result = eval(expression)
             return f"Das Ergebnis von '{expression}' ist {result}"
         else:
-            # Gibt eine Fehlermeldung zurück, wenn unerlaubte Zeichen gefunden werden
             return "Ungültige Zeichen im Ausdruck."
     except Exception as e:
-        # Fängt allgemeine Fehler während der Auswertung ab
         return f"Fehler bei der Berechnung von '{expression}': {e}"
 
 # --- Tool Registry (Verzeichnis der verfügbaren Tools) ---
 AVAILABLE_TOOLS: Dict[str, Callable] = {
     "get_current_datetime": get_current_datetime,
     "calculator": simple_calculator
-    # Hier könnten weitere Tools hinzugefügt werden
+    # Hier können weitere Tools hinzugefügt werden
 }
 
 # --- Konfigurations- und Hilfsfunktionen ---
 def load_agent_config(file_path: str, is_generator_config: bool = False) -> List[Dict[str, Any]] | None:
     """
     Lädt eine Agentenkonfiguration aus einer JSON-Datei.
-    Sortiert die Agenten nach 'round', aber validiert die Struktur nicht mehr hier.
-    Gibt die Liste der Agenten-Dictionaries oder None bei Fehlern zurück.
+    Sortiert die Agenten nach 'round'. Gibt eine Liste der Agenten-Dictionaries oder None bei Fehlern zurück.
     Zeigt Fehlermeldungen in Streamlit an.
     """
     if not file_path or not os.path.exists(file_path):
@@ -112,7 +163,6 @@ def validate_config_list(config_list: List[Dict[str, Any]], source_description: 
     Validiert eine Liste von Agenten-Dictionaries mittels Pattern Matching (match-case).
     Prüft auf erforderliche Schlüssel ('name', 'round', 'system_instruction') und deren Typen.
     Gibt die Liste der validen Agenten zurück oder None, wenn keine validen Agenten gefunden wurden.
-    Zeigt Warnungen für ungültige Agenten an.
     """
     if not config_list:
         st.error(f"❌ Fehler: Die übergebene {source_description} ist leer.")
@@ -152,7 +202,9 @@ def validate_config_list(config_list: List[Dict[str, Any]], source_description: 
     return validated_agents
 
 def get_grounding_info(candidate: Any) -> str | None:
-    """Extrahiert Grounding-Informationen (Websuche) aus einem API-Antwort-Kandidaten."""
+    """
+    Extrahiert Grounding-Informationen (Websuche) aus einem API-Antwort-Kandidaten.
+    """
     try:
         grounding = getattr(candidate, "grounding_metadata", None)
         if grounding:
@@ -203,6 +255,10 @@ def parse_generator_output(response_text: str) -> tuple[List[Dict[str, Any]] | N
 
 # --- Hauptfunktion für den Streamlit-Tab ---
 def build_tab(api_key: str | None = None):
+    """
+    Hauptfunktion, die den KI Workflow Generator & Runner in der Streamlit-Weboberfläche aufbaut.
+    Hier werden Einstellungen, Dateiupload, Workflow-Auswahl und Agenten-Ausführung realisiert.
+    """
     st.set_page_config(page_title="KI Workflow Generator & Runner", layout="wide")
     api_key = api_key or API_KEY
     if not api_key:
@@ -259,8 +315,14 @@ def build_tab(api_key: str | None = None):
         st.json(list(AVAILABLE_TOOLS.keys()))
         model_id = DEFAULT_MODEL_ID
         st.caption(f"Modell: `{model_id}`")
+        
+        # --- RPM Einstellungen in der Sidebar ---
+        st.divider()
+        st.subheader("RPM Einstellungen")
+        rpm_limit = st.number_input("Maximale Anfragen pro Minute (RPM):", min_value=1, max_value=120, value=30, step=1, key="rpm_limit_input")
+        st.session_state.rpm_limit = rpm_limit
 
-    # --- Session State ---
+    # --- Session State initialisieren ---
     if 'message_store' not in st.session_state:
         st.session_state.message_store = {}
     if 'agent_results_display' not in st.session_state:
@@ -373,7 +435,8 @@ def build_tab(api_key: str | None = None):
                 generator_success = False
                 try:
                     client = genai.Client(api_key=api_key)
-                    response = client.models.generate_content(
+                    response = limited_generate_content(
+                        client=client,
                         model=f"models/{model_id}",
                         contents=generator_input_parts,
                         config=GenerateContentConfig(temperature=generator_agent_conf.get("temperature", 0.5))
@@ -548,7 +611,12 @@ def build_tab(api_key: str | None = None):
                                 break
                             try:
                                 effective_model_for_call = f"models/{model_id}"
-                                response = client.models.generate_content(model=effective_model_for_call, contents=conversation_history, config=agent_specific_config)
+                                response = limited_generate_content(
+                                    client=client,
+                                    model=effective_model_for_call,
+                                    contents=conversation_history,
+                                    config=agent_specific_config
+                                )
                                 candidate = response.candidates[0] if response.candidates else None
                                 function_call = None
                                 if candidate and hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') and candidate.content.parts:
