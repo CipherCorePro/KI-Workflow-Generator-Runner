@@ -1,95 +1,103 @@
 # -*- coding: utf-8 -*-
 """
 Dieses Script implementiert einen KI-Workflow-Generator und -Runner mit Streamlit.
-
+Es verwendet unter anderem das strukturierte Pattern Matching (PEP 634-636) und den Union-Typ-Operator (PEP 604).
+Außerdem wird großer Wert auf klare, einfache und lesbare Strukturen gelegt.
+Dieses Skript beinhaltet zusätzlich eine RPM-Funktion, die es erlaubt, die Anfragen an das Gemini Modell
+auf eine bestimmte Anzahl pro Minute zu begrenzen.
 """
 
 # Importiere alle notwendigen Bibliotheken
 import streamlit as st
 import google.genai as genai
 from google.genai.types import Part, Tool, GenerateContentConfig, GoogleSearch, FunctionDeclaration, FunctionResponse
-# === ZUSÄTZLICHE IMPORTS NUR FÜR DECORATOR ===
-import time
-from typing import List, Dict, Any, Callable, Optional, Tuple
-# === ENDE ZUSÄTZLICHE IMPORTS ===
 from dotenv import load_dotenv
 import os
 import json
+from typing import List, Dict, Any, Callable
 import io
 from PIL import Image
 import datetime
 import re
 import zipfile
 import traceback
+import time  # Wird für die RPM-Implementierung benötigt
 
 # --- Konstanten ---
+# Lade API-Key aus .env Datei (falls vorhanden)
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    st.error("❌ API_KEY nicht gefunden. Bitte in .env setzen.")
-    st.stop()
-DEFAULT_MODEL_ID = "gemini-2.5-pro-exp-03-25" # Angepasst, Original: "gemini-2.0-flash-thinking-exp-01-21"
+# Standard-Modell für die Generierung
+DEFAULT_MODEL_ID = "gemini-2.0-flash-thinking-exp"  # Alternativ: "gemini-2.0-pro-exp-02-05"
+# Spezielle Namen und Dateien für den Generator-Workflow
 GENERATOR_WORKFLOW_NAME = "Dynamischer Workflow Generator"
 GENERATOR_CONFIG_FILE = "generator_agent_config.json"
 
-# === HINZUGEFÜGT: RPM Funktionalität  ===
+# --- RPM Funktionalität ---
 def rpm_limiter(func: Callable) -> Callable:
     """
-    Decorator für RPM-Limitierung. Liest Limit aus st.session_state['rpm_limit_input'].
+    Decorator, der sicherstellt, dass die dekorierte Funktion nicht öfter als eine bestimmte Anzahl
+    von Aufrufen pro Minute ausgeführt wird.
+    
+    Der maximale Wert wird in st.session_state['rpm_limit'] gespeichert.
+    Falls das Limit erreicht wird, wartet die Funktion, bis 60 Sekunden seit dem letzten Reset vergangen sind.
     """
     def wrapper(*args, **kwargs):
-        rpm_limit = st.session_state.get("rpm_limit_input", 10) # Key aus Sidebar verwenden
+        # Hole den aktuellen RPM-Limit-Wert; Standard ist 30 Anfragen pro Minute.
+        rpm_limit = st.session_state.get("rpm_limit", 30)
         current_time = time.time()
+        # Initialisiere Timer und Aufrufzähler, falls sie noch nicht existieren.
         if "rpm_last_reset" not in st.session_state:
             st.session_state.rpm_last_reset = current_time
             st.session_state.rpm_calls = 0
 
+        # Falls seit dem letzten Reset mehr als 60 Sekunden vergangen sind, setze den Zähler zurück.
         if current_time - st.session_state.rpm_last_reset >= 60:
             st.session_state.rpm_last_reset = current_time
             st.session_state.rpm_calls = 0
-            try: st.sidebar.caption(f"RPM Reset @ {datetime.datetime.now():%H:%M:%S}")
-            except: pass # Fehler ignorieren, falls Sidebar nicht mehr da ist
 
+        # Wenn das Limit erreicht wurde, berechne die Wartezeit und pausiere.
         if st.session_state.rpm_calls >= rpm_limit:
-            wait_time = 60.0 - (current_time - st.session_state.rpm_last_reset)
-            if wait_time > 0:
-                 st.warning(f"🚦 RPM Limit ({rpm_limit}/min) erreicht. Warte {wait_time:.1f} Sekunden...")
-                 time.sleep(wait_time)
-                 st.session_state.rpm_last_reset = time.time()
-                 st.session_state.rpm_calls = 0
-                 try: st.sidebar.caption(f"RPM Reset @ {datetime.datetime.now():%H:%M:%S}")
-                 except: pass
+            wait_time = 60 - (current_time - st.session_state.rpm_last_reset)
+            st.warning(f"RPM Limit erreicht. Warte {wait_time:.2f} Sekunden, bis neue Anfragen gesendet werden können.")
+            time.sleep(wait_time)
+            st.session_state.rpm_last_reset = time.time()
+            st.session_state.rpm_calls = 0
 
-        # Rufe die eigentliche Funktion auf
-        # WICHTIG: Fehler innerhalb der Funktion werden hier NICHT abgefangen,
-        # das muss außerhalb im aufrufenden Code geschehen!
-        result = func(*args, **kwargs)
-
+        # Erhöhe den Zähler für die aktuellen Anfragen
         st.session_state.rpm_calls += 1
-        if "rpm_limit_input" in st.session_state:
-            try: st.sidebar.caption(f"RPM: {st.session_state.rpm_calls}/{rpm_limit} (Reset in {max(0, 60 - (time.time() - st.session_state.rpm_last_reset)):.0f}s)")
-            except: pass
-        return result
+        return func(*args, **kwargs)
     return wrapper
 
 @rpm_limiter
 def limited_generate_content(client: genai.Client, model: str, contents: List[Part], config: GenerateContentConfig) -> Any:
     """
-    Wrapper um client.models.generate_content, um den @rpm_limiter anzuwenden.
-    Parameter und Rückgabe wie client.models.generate_content.
+    Wrapper um den API-Aufruf an das Gemini Modell zu rate-limiten.
+    Verwendet den in st.session_state gesetzten RPM-Wert.
+    
+    Parameter:
+      - client: Instanz des genai.Client.
+      - model: Modellbezeichnung als String.
+      - contents: Liste von Part-Objekten, die den Input darstellen.
+      - config: Konfiguration für die Generierung (z.B. Temperatur).
+    
+    Rückgabe:
+      - Antwort des API-Aufrufs.
     """
-    # Der eigentliche API-Call, der durch den Decorator begrenzt wird
     return client.models.generate_content(model=model, contents=contents, config=config)
-# === ENDE RPM Funktionalität ===
 
-
-# --- Hilfsfunktionen (Tools für Agenten ) ---
+# --- Hilfsfunktionen (Tools für Agenten) ---
 def get_current_datetime() -> str:
     """Gibt das aktuelle Datum und die Uhrzeit im ISO-Format zurück."""
     return datetime.datetime.now().isoformat()
 
 def simple_calculator(expression: str) -> str:
-    """Berechnet einfachen mathematischen Ausdruck (+, -, *, /). Unsicher!"""
+    """
+    Berechnet einen einfachen mathematischen Ausdruck (+, -, *, /).
+    Sicherheitshinweis: eval() ist hier nur zur Demonstration! In produktiven Systemen
+    sollte eine sicherere Methode (z.B. ein dedizierter Parser) verwendet werden,
+    um Code-Injection-Risiken zu vermeiden.
+    """
     try:
         allowed_chars = "0123456789+-*/.() "
         if all(c in allowed_chars for c in expression):
@@ -100,465 +108,702 @@ def simple_calculator(expression: str) -> str:
     except Exception as e:
         return f"Fehler bei der Berechnung von '{expression}': {e}"
 
-# --- Tool Registry  ---
+# --- Tool Registry (Verzeichnis der verfügbaren Tools) ---
 AVAILABLE_TOOLS: Dict[str, Callable] = {
     "get_current_datetime": get_current_datetime,
     "calculator": simple_calculator
+    # Hier können weitere Tools hinzugefügt werden
 }
 
-# --- Konfigurations- und Hilfsfunktionen , Typ-Hinweise ---
-def load_agent_config(file_path: str, is_generator_config: bool = False) -> Optional[List[Dict[str, Any]]]:
-    """Lädt Agentenkonfiguration aus JSON."""
+# --- Konfigurations- und Hilfsfunktionen ---
+def load_agent_config(file_path: str, is_generator_config: bool = False) -> List[Dict[str, Any]] | None:
+    """
+    Lädt eine Agentenkonfiguration aus einer JSON-Datei.
+    Sortiert die Agenten nach 'round'. Gibt eine Liste der Agenten-Dictionaries oder None bei Fehlern zurück.
+    Zeigt Fehlermeldungen in Streamlit an.
+    """
     if not file_path or not os.path.exists(file_path):
-        error_key = f"error_config_nf_{file_path}";
-        if error_key not in st.session_state: st.error(f"❌ Konfig '{file_path or '?'}' nicht gefunden."); st.session_state[error_key] = True
+        error_key = f"error_config_not_found_{file_path}"
+        if error_key not in st.session_state:
+             st.error(f"❌ Konfigurationsdatei '{file_path or 'Kein Pfad angegeben'}' nicht gefunden.")
+             st.session_state[error_key] = True
         return None
-    error_key = f"error_config_nf_{file_path}";
-    if error_key in st.session_state: del st.session_state[error_key]
+
+    error_key = f"error_config_not_found_{file_path}"
+    if error_key in st.session_state:
+        del st.session_state[error_key]
+
     try:
-        with open(file_path, 'r', encoding='utf-8') as f: data = json.load(f)
-        if not isinstance(data, list): st.error(f"❌ Konfig '{file_path}' ist keine Liste."); return None
+        with open(file_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+
+        if not isinstance(config_data, list):
+             st.error(f"❌ Fehler: Konfigurationsdatei '{file_path}' enthält keine Liste von Agenten.")
+             return None
+
         if not is_generator_config:
-            try: data.sort(key=lambda x: x.get('round', float('inf')))
-            except TypeError: st.error(f"❌ Sortierfehler '{file_path}'. 'round' muss Zahl sein."); return None
-        return data
-    except json.JSONDecodeError as e: st.error(f"❌ JSON-Fehler in '{file_path}': {e}"); return None
-    except Exception as e: st.error(f"❌ Ladefehler Konfig '{file_path}': {e}"); st.error(traceback.format_exc()); return None
+            try:
+                config_data.sort(key=lambda x: x.get('round', float('inf')))
+            except TypeError:
+                st.error(f"❌ Fehler beim Sortieren der Agenten in '{file_path}'. Stellen Sie sicher, dass 'round' eine Zahl ist.")
+                return None
 
-def validate_config_list(config_list: List[Dict[str, Any]], source_desc: str = "Konfiguration") -> Optional[List[Dict[str, Any]]]:
-    """Validiert Agenten-Struktur und Typen - aus Original."""
-    if not config_list: st.error(f"❌ Fehler: {source_desc} ist leer."); return None
-    valid_agents: List[Dict[str, Any]] = []; invalid = False; valid_found = False
-    for i, agent_dict in enumerate(config_list):
-        if not isinstance(agent_dict, dict): st.warning(f"Überspringe #{i+1} in '{source_desc}' (kein dict)."); invalid = True; continue
+        return config_data
+
+    except json.JSONDecodeError as e:
+        st.error(f"❌ Fehler beim Parsen der JSON-Datei '{file_path}': {e}")
+        return None
+    except Exception as e:
+        st.error(f"❌ Unbekannter Fehler beim Laden der Konfiguration '{file_path}': {e}")
+        st.error(traceback.format_exc())
+        return None
+
+def validate_config_list(config_list: List[Dict[str, Any]], source_description: str = "Konfiguration") -> List[Dict[str, Any]] | None:
+    """
+    Validiert eine Liste von Agenten-Dictionaries mittels Pattern Matching (match-case).
+    Prüft auf erforderliche Schlüssel ('name', 'round', 'system_instruction') und deren Typen.
+    Gibt die Liste der validen Agenten zurück oder None, wenn keine validen Agenten gefunden wurden.
+    """
+    if not config_list:
+        st.error(f"❌ Fehler: Die übergebene {source_description} ist leer.")
+        return None
+
+    valid_config_found = False
+    validated_agents: List[Dict[str, Any]] = []
+    any_invalid = False
+
+    for agent_dict in config_list:
+        if not isinstance(agent_dict, dict):
+            st.warning(f"Überspringe Eintrag in '{source_description}', da es kein Dictionary ist: {agent_dict}")
+            any_invalid = True
+            continue
+
         match agent_dict:
-            case { "name": str(), "round": int(), "system_instruction": str(), **other_keys }: # Original Pattern
-                valid_agents.append(agent_dict); valid_found = True
+            case { "name": str(), "round": int(), "system_instruction": str(), **other_keys }:
+                validated_agents.append(agent_dict)
+                valid_config_found = True
             case _:
-                st.warning(f"Agent '{agent_dict.get('name', f'Unbekannt #{i+1}')}' hat ungültige Struktur/Typen ('name':str, 'round':int, 'system_instruction':str). Ignoriert.")
-                invalid = True
-    if invalid: st.warning(f"⚠️ Mindestens ein Agent in '{source_desc}' war ungültig.")
-    if not valid_found: st.error(f"❌ Keine validen Agenten in '{source_desc}'."); return None
-    try: valid_agents.sort(key=lambda x: x.get('round', float('inf')))
-    except TypeError: st.error(f"❌ Sortierfehler validierte Agenten.")
-    return valid_agents
+                st.warning(f"Agent '{agent_dict.get('name', 'Unbekannt')}' in '{source_description}' hat eine ungültige Struktur oder fehlende/falsche Typen für 'name'(str), 'round'(int) oder 'system_instruction'(str). Agent wird ignoriert.")
+                any_invalid = True
 
-def get_grounding_info(candidate: Any) -> Optional[str]:
-    """Extrahiert Grounding-Infos (Websuche) - aus Original."""
+    if any_invalid:
+         st.error(f"❌ Mindestens ein Agent in '{source_description}' war ungültig und wurde ignoriert.")
+
+    if not valid_config_found:
+         st.error(f"❌ Keine validen Agenten in '{source_description}' gefunden.")
+         return None
+
+    try:
+        validated_agents.sort(key=lambda x: x.get('round', float('inf')))
+    except TypeError:
+       st.error(f"❌ Fehler beim Sortieren der validierten Agenten aus '{source_description}'.")
+       return None
+
+    return validated_agents
+
+def get_grounding_info(candidate: Any) -> str | None:
+    """
+    Extrahiert Grounding-Informationen (Websuche) aus einem API-Antwort-Kandidaten.
+    """
     try:
         grounding = getattr(candidate, "grounding_metadata", None)
         if grounding:
-            search_entry = getattr(grounding, "search_entry_point", None)
-            if search_entry:
-                 uri = getattr(search_entry, "uri", None) or getattr(search_entry, "rendered_content", None)
+            search_entry_point = getattr(grounding, "search_entry_point", None)
+            if search_entry_point:
+                 uri = getattr(search_entry_point, "uri", None) or getattr(search_entry_point, "rendered_content", None)
                  if uri: return f"Quelle (URI): {uri}"
-            queries = getattr(grounding, "web_search_queries", [])
-            if queries:
-                 titles = [q.display_title for q in queries if hasattr(q, 'display_title') and q.display_title]
+            web_search_queries = getattr(grounding, "web_search_queries", None)
+            if web_search_queries:
+                 titles = [q.display_title for q in web_search_queries if hasattr(q, 'display_title') and q.display_title]
                  if titles: return f"Suchanfragen verwendet: {', '.join(titles)}"
                  else: return "Websuche wurde verwendet (keine spezifischen Titel)."
-    except AttributeError: pass
-    except Exception as e: st.warning(f"⚠️ Fehler Grounding-Infos: {e}")
+    except AttributeError:
+        pass
+    except Exception as e:
+        st.warning(f"⚠️ Fehler beim Extrahieren der Grounding-Infos: {e}")
     return None
 
-def parse_generator_output(response_text: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    """Parst Generator-Output (JSON-Liste von Agenten) - aus Original."""
+def parse_generator_output(response_text: str) -> tuple[List[Dict[str, Any]] | None, str | None]:
+    """
+    Versucht, eine JSON-Liste für Agentenkonfigurationen aus dem Antworttext des Generators zu extrahieren.
+    Bereinigt übliche LLM-Artefakte wie Markdown-Code-Zäune.
+    Gibt ein Tupel zurück: (config_list | None, error_message | None).
+    """
     try:
-        cleaned = response_text.strip()
-        if cleaned.startswith("```json"): cleaned = cleaned[7:]
-        elif cleaned.startswith("```"): cleaned = cleaned[3:]
-        if cleaned.endswith("```"): cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
-        if not cleaned: return None, "Generator-Antwort war nach Bereinigung leer."
-        config_list = json.loads(cleaned)
-        if not isinstance(config_list, list): return None, "Generator-Antwort ist keine JSON-Liste."
+        cleaned_text = response_text.strip()
+        if cleaned_text.startswith("```json"):
+            cleaned_text = cleaned_text[7:].strip()
+        elif cleaned_text.startswith("```"):
+             cleaned_text = cleaned_text[3:].strip()
+        if cleaned_text.endswith("```"):
+            cleaned_text = cleaned_text[:-3].strip()
+
+        config_list = json.loads(cleaned_text)
+
+        if not isinstance(config_list, list):
+            return None, "Generator-Antwort ist keine JSON-Liste."
         if not all(isinstance(item, dict) for item in config_list):
-             bad = next((item for item in config_list if not isinstance(item, dict)), None)
-             return None, f"Enthält Nicht-Dictionaries (z.B.: {str(bad)[:100]}...).'"
+             first_bad_item = next((item for item in config_list if not isinstance(item, dict)), None)
+             return None, f"Generator-Liste enthält Elemente, die keine Dictionaries sind (z.B.: {str(first_bad_item)[:100]}...).'"
         return config_list, None
+
     except json.JSONDecodeError as e:
-        error_msg = f"Generator-Antwort ist kein valides JSON: {e}\n\nEmpfangen (Anfang):\n```\n{response_text[:500]}...\n```"
+        error_msg = f"Generator-Antwort ist kein valides JSON: {e}\n\nEmpfangener Text (Anfang):\n```\n{response_text[:500]}...\n```"
         return None, error_msg
-    except Exception as e: return None, f"Unerwarteter Fehler beim Parsen der Generator-Antwort: {e}"
+    except Exception as e:
+         return None, f"Unerwarteter Fehler beim Parsen der Generator-Antwort: {e}"
 
 # --- Hauptfunktion für den Streamlit-Tab ---
-def build_tab():
-    """Baut die Streamlit UI und steuert den Workflow."""
+def build_tab(api_key: str | None = None):
+    """
+    Hauptfunktion, die den KI Workflow Generator & Runner in der Streamlit-Weboberfläche aufbaut.
+    Hier werden Einstellungen, Dateiupload, Workflow-Auswahl und Agenten-Ausführung realisiert.
+    """
     st.set_page_config(page_title="KI Workflow Generator & Runner", layout="wide")
+    api_key = api_key or API_KEY
+    if not api_key:
+        st.error("❌ Kein API-Key gefunden.")
+        return
 
     st.title("🤖 KI Workflow Generator & Runner")
-    st.markdown("Wähle Workflow ODER lass KI Workflow generieren!")
+    st.markdown("Wähle einen vordefinierten Workflow ODER lass die KI einen Workflow für deine Aufgabe generieren!")
 
-    supported_workflows = { name: file for name, file in [
-        (GENERATOR_WORKFLOW_NAME, GENERATOR_CONFIG_FILE),
-        ("Python Aufgabe", "agents_config_python.json"), ("C++ Aufgabe", "agents_config_cpp.json"),
-        ("Java Aufgabe", "agents_config_java.json"), ("JavaScript Aufgabe", "agents_config_javascript.json"),
-        ("Python Plugin Entwickler", "plugin_developer_config.json") ] if os.path.exists(file) }
-    if not supported_workflows: st.error("Keine Konfigurationsdateien gefunden!"); st.stop()
-
-    if 'selected_workflow' not in st.session_state or st.session_state.selected_workflow not in supported_workflows:
+    # --- Workflow-Auswahl ---
+    supported_workflows = {
+        GENERATOR_WORKFLOW_NAME: GENERATOR_CONFIG_FILE,
+        "Python Aufgabe": "agents_config_python.json",
+        "C++ Aufgabe": "agents_config_cpp.json",
+        "Java Aufgabe": "agents_config_java.json",
+        "JavaScript Aufgabe": "agents_config_javascript.json",
+        "Python Plugin Entwickler": "plugin_developer_config.json"
+    }
+    if 'selected_workflow' not in st.session_state:
         st.session_state.selected_workflow = list(supported_workflows.keys())[0]
-    selected_workflow_name = st.selectbox("Wähle Workflow:", options=list(supported_workflows.keys()), key="selected_workflow")
-    agent_config_file_path = supported_workflows[selected_workflow_name]
+    selected_workflow_name = st.selectbox("Wähle den Workflow:", options=list(supported_workflows.keys()), key="selected_workflow")
+    agent_config_file_path = supported_workflows.get(selected_workflow_name)
     is_generator_mode = (selected_workflow_name == GENERATOR_WORKFLOW_NAME)
+
+    # --- Konfiguration laden (für Sidebar) ---
+    config_for_sidebar = None
+    if agent_config_file_path:
+        config_for_sidebar = load_agent_config(agent_config_file_path)
 
     # --- Sidebar ---
     with st.sidebar:
         st.header("Einstellungen & Infos")
-        st.info(f"Modus: **{selected_workflow_name}**"); st.markdown(f"Konfig: `{agent_config_file_path}`")
-        cfg_sidebar = load_agent_config(agent_config_file_path, is_generator_config=is_generator_mode)
-        if cfg_sidebar:
-            valid_cfg = validate_config_list(cfg_sidebar, f"'{agent_config_file_path}' (Sidebar)")
-            if valid_cfg:
-                st.success(f"✅ Geladen ({len(valid_cfg)} Agenten).")
-                if not is_generator_mode:
-                    st.subheader("Agentenübersicht:"); summary = [{"R": a.get("round"), "Name": a.get("name"), "Desc": a.get("description", "-")} for a in valid_cfg]
-                    st.dataframe(summary, use_container_width=True, hide_index=True, column_config={"R": st.column_config.NumberColumn("R", width="small"), "Name": "Name", "Desc": "Info"})
-                    with st.expander("Vollständige JSON"): st.json(valid_cfg)
-        st.divider(); st.subheader("Tools"); st.json(list(AVAILABLE_TOOLS.keys())); model_id = DEFAULT_MODEL_ID; st.caption(f"Modell: `{model_id}`"); st.divider()
-        # === RPM EINSTELLUNG ===
+        st.info(f"Modus: **{selected_workflow_name}**")
+        if agent_config_file_path:
+            st.markdown(f"Konfig: `{agent_config_file_path}`")
+            if config_for_sidebar is not None:
+                validated_sidebar_config = validate_config_list(config_for_sidebar, f"'{agent_config_file_path}' (für Sidebar)")
+                if validated_sidebar_config:
+                    st.success(f"✅ Geladen ({len(validated_sidebar_config)} Agenten).")
+                    if not is_generator_mode:
+                         st.subheader("Agentenübersicht:")
+                         agent_summary = [{"R": a.get("round"), "Name": a.get("name"), "Desc": a.get("description", "-")} for a in validated_sidebar_config]
+                         st.dataframe(agent_summary, use_container_width=True, hide_index=True, column_config={"R": st.column_config.NumberColumn(width="small"), "Name": st.column_config.TextColumn(width="medium"), "Desc": st.column_config.TextColumn(width="large")})
+                         with st.expander("Vollständige JSON"):
+                             st.json(validated_sidebar_config)
+                else:
+                    st.error("❌ Konfig für Sidebar ungültig.")
+            else:
+                pass
+        else:
+            st.warning("Kein Konfigurationspfad definiert.")
+        st.divider()
+        st.subheader("Tools (für Agenten)")
+        st.json(list(AVAILABLE_TOOLS.keys()))
+        model_id = DEFAULT_MODEL_ID
+        st.caption(f"Modell: `{model_id}`")
+        
+        # --- RPM Einstellungen in der Sidebar ---
+        st.divider()
         st.subheader("RPM Einstellungen")
-        rpm_limit_value = st.number_input(
-            "Maximale Anfragen pro Minute (RPM):",
-            min_value=1, max_value=120,
-            value=st.session_state.get("rpm_limit_input", 10),
-            step=1, key="rpm_limit_input", # Key für Widget und Session State
-            help="Steuert, wie viele API-Aufrufe pro Minute maximal gesendet werden. Standard: 30"
-        )
-        # === ENDE RPM EINSTELLUNG ===
+        rpm_limit = st.number_input("Maximale Anfragen pro Minute (RPM):", min_value=1, max_value=120, value=30, step=1, key="rpm_limit_input")
+        st.session_state.rpm_limit = rpm_limit
 
-    # --- Session State  ---
-    if 'message_store' not in st.session_state: st.session_state.message_store = {}
-    if 'agent_results_display' not in st.session_state: st.session_state.agent_results_display = []
-    if 'last_question_processed' not in st.session_state: st.session_state.last_question_processed = ""
-    if 'uploaded_files_data' not in st.session_state: st.session_state.uploaded_files_data = []
-    if 'last_workflow_processed' not in st.session_state: st.session_state.last_workflow_processed = ""
+    # --- Session State initialisieren ---
+    if 'message_store' not in st.session_state:
+        st.session_state.message_store = {}
+    if 'agent_results_display' not in st.session_state:
+        st.session_state.agent_results_display = []
+    if 'last_question_processed' not in st.session_state:
+        st.session_state.last_question_processed = ""
+    if 'uploaded_files_data' not in st.session_state:
+        st.session_state.uploaded_files_data = []
+    if 'last_workflow_processed' not in st.session_state:
+        st.session_state.last_workflow_processed = ""
 
-    # --- Eingabe (aus Original) ---
-    q_label = f"📝 Aufgabe für '{selected_workflow_name}':" if not is_generator_mode else "📝 Ziel für Workflow-Generierung:"
-    question = st.text_area(q_label, key="task_description")
-    up_files = st.file_uploader("📎 Dateien hochladen (Kontext):", type=["png", "jpg", "jpeg", "webp", "txt", "py", "md", "csv", "json", "html", "css", "js", "yaml", "sh", "java", "cpp", "h", "cs", "go", "rb", "php"], accept_multiple_files=True, key="file_uploader")
+    # --- Eingabe ---
+    question_label = f"📝 Aufgabe für '{selected_workflow_name}':"
+    if is_generator_mode:
+        question_label = "📝 Ziel für Workflow-Generierung:"
+    question = st.text_area(question_label, key="task_description")
+    uploaded_files = st.file_uploader("📎 Dateien hochladen (Kontext):", type=["png", "jpg", "jpeg", "webp", "txt", "py", "md", "csv", "json", "html", "css", "js", "yaml", "sh", "java", "cpp", "h", "cs", "go", "rb", "php"], accept_multiple_files=True, key="file_uploader")
 
-    # --- Datei Handling (aus Original) ---
+    # --- Datei-Verarbeitung und Anzeige ---
     current_uploaded_files_data = []
-    if up_files:
+    if uploaded_files:
         st.write("Neu hochgeladene Dateien:")
-        for uf in up_files:
+        for uploaded_file in uploaded_files:
             try:
-                fb = uf.getvalue(); fd = {"name": uf.name, "type": uf.type, "bytes": fb}
-                current_uploaded_files_data.append(fd)
-                if uf.type.startswith("image/"): st.image(fb, caption=f"{uf.name}", width=100)
-                else: st.caption(f"- `{uf.name}` ({uf.type})")
-            except Exception as e: st.error(f"Fehler '{uf.name}': {e}")
+                file_bytes = uploaded_file.getvalue()
+                file_data = {"name": uploaded_file.name, "type": uploaded_file.type, "bytes": file_bytes}
+                current_uploaded_files_data.append(file_data)
+                if uploaded_file.type.startswith("image/"):
+                    st.image(file_bytes, caption=f"{uploaded_file.name}", width=100)
+                else:
+                    st.caption(f"- `{uploaded_file.name}` ({uploaded_file.type})")
+            except Exception as file_e:
+                 st.error(f"Fehler beim Verarbeiten der Datei '{uploaded_file.name}': {file_e}")
         st.session_state.uploaded_files_data = current_uploaded_files_data
         st.success(f"{len(current_uploaded_files_data)} Datei(en) bereit.")
     elif st.session_state.uploaded_files_data:
          st.write(f"Vorhandene Dateien ({len(st.session_state.uploaded_files_data)}):")
          with st.expander("Dateien verwalten", expanded=False):
-             rm_indices = [];
+             indices_to_remove = []
              for idx in range(len(st.session_state.uploaded_files_data) -1, -1, -1):
-                 fd = st.session_state.uploaded_files_data[idx]
+                 file_data = st.session_state.uploaded_files_data[idx]
                  col1, col2 = st.columns([0.8, 0.2])
                  with col1:
-                    if fd["type"].startswith("image/"): st.image(fd["bytes"], caption=f"{fd['name']}", width=100)
-                    else: st.caption(f"- `{fd['name']}` ({fd['type']})")
+                    if file_data["type"].startswith("image/"):
+                        st.image(file_data["bytes"], caption=f"{file_data['name']}", width=100)
+                    else:
+                        st.caption(f"- `{file_data['name']}` ({file_data['type']})")
                  with col2:
-                    if st.button(f"❌", key=f"rm_{idx}_{fd['name']}", help=f"'{fd['name']}' entfernen"): rm_indices.append(idx)
-             if rm_indices:
-                 rm_indices.sort(reverse=True)
-                 for index in rm_indices:
-                      if 0 <= index < len(st.session_state.uploaded_files_data): st.session_state.uploaded_files_data.pop(index)
+                    if st.button(f"❌", key=f"remove_file_{file_data['name']}_{idx}", help=f"'{file_data['name']}' entfernen"):
+                         indices_to_remove.append(idx)
+             if indices_to_remove:
+                 indices_to_remove.sort(reverse=True)
+                 for index in indices_to_remove:
+                     st.session_state.uploaded_files_data.pop(index)
                  st.rerun()
-             if not st.session_state.uploaded_files_data: st.info("Keine Dateien vorhanden.")
+             if not st.session_state.uploaded_files_data:
+                 st.info("Keine Dateien vorhanden.")
 
-    # --- Start Button ---
-    btn_label = f"🚀 '{selected_workflow_name}'-Workflow starten" if not is_generator_mode else "🧬 Workflow generieren & ausführen"
-    if st.button(btn_label, key="start_button"):
-        if not question and not st.session_state.uploaded_files_data: st.warning("Bitte Aufgabe beschreiben oder Dateien hochladen."); st.stop()
+    # --- Start-Button ---
+    button_label = f"🚀 '{selected_workflow_name}'-Workflow starten"
+    if is_generator_mode:
+        button_label = "🧬 Workflow generieren & ausführen"
+    if st.button(button_label, key="start_button"):
 
-        st.session_state.message_store = {}; st.session_state.agent_results_display = []
-        st.session_state.last_question_processed = question; st.session_state.last_workflow_processed = selected_workflow_name
-        results_placeholder = st.empty(); final_agents_config = None
-        prompt_exec = question; gen_agent_conf = None
+        if not question and not st.session_state.uploaded_files_data:
+            st.warning("Bitte Aufgabe beschreiben oder Dateien hochladen.")
+            st.stop()
 
-        # --- Phase 1: Generator  ---
+        st.session_state.message_store = {}
+        st.session_state.agent_results_display = []
+        st.session_state.last_question_processed = question
+        st.session_state.last_workflow_processed = selected_workflow_name
+
+        results_placeholder = st.empty()
+        final_agents_config = None
+        prompt_for_execution = question
+
+        # --- Phase 1: Workflow-Generierung ---
         if is_generator_mode:
-            results_placeholder.info("⏳ Starte Generator...")
             with st.spinner("🧠 Workflow-Generator arbeitet..."):
-                cfg_list = load_agent_config(GENERATOR_CONFIG_FILE, True)
-                validated_cfg = validate_config_list(cfg_list, f"'{GENERATOR_CONFIG_FILE}'") if cfg_list else None
-                if not validated_cfg: st.error("Generator-Konfig ungültig."); results_placeholder.empty(); st.stop()
-                gen_agent_conf = validated_cfg[0]
+                generator_config_list = load_agent_config(GENERATOR_CONFIG_FILE, is_generator_config=True)
+                generator_config = validate_config_list(generator_config_list, f"'{GENERATOR_CONFIG_FILE}'") if generator_config_list else None
+                if generator_config is None or not generator_config:
+                    st.error("Generator-Konfig ungültig.")
+                    st.stop()
 
-                gen_parts: List[Part] = [Part(text=f"System Anweisung ({gen_agent_conf.get('name')}):\n{gen_agent_conf.get('system_instruction')}\n---"), Part(text=f"Nutzeranfrage/Ziel:\n{prompt_exec}")]
+                generator_input_parts: List[Part] = []
+                generator_agent_conf = generator_config[0]
+                generator_input_parts.append(Part(text=f"System Anweisung ({generator_agent_conf.get('name')}):\n{generator_agent_conf.get('system_instruction')}\n---"))
+                generator_input_parts.append(Part(text=f"Nutzeranfrage/Ziel:\n{question}"))
                 if st.session_state.uploaded_files_data:
-                    gen_parts.append(Part(text="\n\n--- START KONTEXT DATEIEN ---"))
-                    for fd in st.session_state.uploaded_files_data:
-                        fn, ft, fb = fd["name"], fd["type"], fd["bytes"]
-                        if ft.startswith("image/"):
-                            try: image_part = Part(inline_data={"mime_type": ft, "data": fb}); gen_parts.extend([Part(text=f"\nBild: `{fn}`"), image_part])
-                            except Exception as e: st.warning(f"⚠️ Bild '{fn}' Ignoriert: {e}")
+                    generator_input_parts.append(Part(text="\n\n--- START KONTEXT DATEIEN ---"))
+                    for file_data in st.session_state.uploaded_files_data:
+                        file_name, file_type, file_bytes = file_data["name"], file_data["type"], file_data["bytes"]
+                        if file_type.startswith("image/"):
+                            image_part = Part(inline_data={"mime_type": file_type, "data": file_bytes})
+                            generator_input_parts.append(Part(text=f"\nBild: `{file_name}`"))
+                            generator_input_parts.append(image_part)
                         else:
-                            try: content = fb.decode('utf-8'); gen_parts.append(Part(text=f"\n--- START DATEI: `{fn}` ---\n{content}\n--- ENDE DATEI: `{fn}` ---"))
-                            except Exception as decode_e: content = f"[Fehler beim Dekodieren: {decode_e}]"; st.warning(f"Datei '{fn}' ({ft}) ignoriert."); gen_parts.append(Part(text=f"\n--- START DATEI: `{fn}` ---\n{content}\n--- ENDE DATEI: `{fn}` ---"))
-                    gen_parts.append(Part(text="\n--- ENDE KONTEXT DATEIEN ---"))
+                            try:
+                                file_content = file_bytes.decode('utf-8')
+                            except Exception as decode_e:
+                                file_content = f"[Fehler beim Dekodieren: {decode_e}]"
+                                st.warning(f"Datei '{file_name}' ({file_type}) ignoriert.")
+                            file_text_part = Part(text=(f"\n--- START DATEI: `{file_name}` ---\n{file_content}\n--- ENDE DATEI: `{file_name}` ---"))
+                            generator_input_parts.append(file_text_part)
+                    generator_input_parts.append(Part(text="\n--- ENDE KONTEXT DATEIEN ---"))
 
-                gen_output = "[Generator nicht geantwortet]"; gen_success = False
+                generator_output = "[Generator nicht geantwortet]"
+                generator_success = False
                 try:
-                    client = genai.Client(api_key=API_KEY)
-                    # === Verwende limited_generate_content ===
+                    client = genai.Client(api_key=api_key)
                     response = limited_generate_content(
                         client=client,
                         model=f"models/{model_id}",
-                        contents=gen_parts,
-                        config=GenerateContentConfig(temperature=gen_agent_conf.get("temperature", 0.5))
+                        contents=generator_input_parts,
+                        config=GenerateContentConfig(temperature=generator_agent_conf.get("temperature", 0.5))
                     )
-                  
-                    # Antwort auswerten 
                     if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-                        gen_output = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')).strip()
-                        if gen_output: gen_success = True
-                        else: gen_output = "[Generator gab leere Antwort]"; gen_success = False
+                        generator_output = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')).strip()
+                        if generator_output:
+                            generator_success = True
+                        else:
+                            generator_output = "[Generator gab leere Antwort]"
                     else:
-                         feedback = getattr(response, 'prompt_feedback', None); block_reason = getattr(feedback, 'block_reason', "?"); block_msg = getattr(feedback, 'block_reason_message', "?")
-                         gen_output = f"[Fehler: Gen-Antwort ungültig. Grund: {block_reason}. Nachricht: {block_msg}]"; gen_success = False; st.error(f"Generator-Fehler: {gen_output}")
-
-                # Allgemeine Fehlerbehandlung 
+                        feedback = getattr(response, 'prompt_feedback', None)
+                        block_reason = getattr(feedback, 'block_reason', "Unbekannt") if feedback else "Unbekannt"
+                        block_msg = getattr(feedback, 'block_reason_message', "Keine Details") if feedback else "Keine Details"
+                        generator_output = f"[Fehler: Generator-Antwort ungültig. Grund: {block_reason}. Nachricht: {block_msg}]"
+                        st.error(f"Generator-Fehler: {generator_output}")
                 except Exception as gen_e:
                     st.error(f"❌ Kritischer Generator-Fehler: {gen_e}")
                     st.error(traceback.format_exc())
                     st.stop()
 
-                st.session_state.agent_results_display.append({"agent": gen_agent_conf.get('name'), "status": "Erfolgreich" if gen_success else "Fehlgeschlagen", "output": gen_output, "sources": None, "details": "Output des Workflow Generators"})
-                if not gen_success: st.error("Workflow-Generierung fehlgeschlagen."); st.stop()
+                st.session_state.agent_results_display.append({
+                    "agent": generator_agent_conf.get("name"),
+                    "status": "Erfolgreich" if generator_success else "Fehlgeschlagen",
+                    "output": generator_output,
+                    "sources": None,
+                    "details": "Output des Workflow Generators"
+                })
+                if not generator_success:
+                    st.error("Workflow-Generierung fehlgeschlagen.")
+                    st.stop()
 
-                results_placeholder.info("⚙️ Parse & Validiere Workflow..."); parsed_cfg, parse_err = parse_generator_output(gen_output)
-                if parse_err: st.error(f"Parse Fehler:\n{parse_err}"); st.code(gen_output, 'text'); st.stop()
-                if not parsed_cfg: st.error("Generator gab leere Konfig zurück."); st.code(gen_output, 'text'); st.stop()
+                generated_config_list, parse_error = parse_generator_output(generator_output)
+                if parse_error:
+                    st.error("Fehler Parsen Generator-Antwort:")
+                    st.error(parse_error)
+                    st.code(generator_output, language='text')
+                    st.stop()
+                if not generated_config_list:
+                    st.error("Generator gab leere Konfig zurück.")
+                    st.code(generator_output, language='text')
+                    st.stop()
 
-                validated_cfg = validate_config_list(parsed_cfg, "generierter Konfiguration")
-                if not validated_cfg: st.error("❌ Generierte Konfig ungültig."); st.subheader("Fehlerhafter JSON-Output:"); st.code(gen_output, language="json"); st.stop()
+                validated_generated_config = validate_config_list(generated_config_list, "generierter Konfiguration")
+                if validated_generated_config is None:
+                    st.error("Generierte Konfiguration ungültig. Prozess gestoppt.")
+                    st.subheader("Fehlerhafter JSON-Output des Generators:")
+                    st.code(generator_output, language="json")
+                    st.stop()
+                else:
+                    final_agents_config = validated_generated_config
+                    st.success(f"✅ Workflow mit {len(final_agents_config)} Agenten generiert!")
+                    st.sidebar.subheader("Dynamisch generierte Agenten:")
+                    gen_agent_summary = [{"R": a.get("round"), "Name": a.get("name"), "Desc": a.get("description", "-")} for a in final_agents_config]
+                    st.sidebar.dataframe(gen_agent_summary, use_container_width=True, hide_index=True,
+                                         column_config={"R": st.column_config.NumberColumn(width="small"),
+                                                        "Name": st.column_config.TextColumn(width="medium"),
+                                                        "Desc": st.column_config.TextColumn(width="large")})
+                    with st.sidebar.expander("Generierte JSON"):
+                        st.json(final_agents_config)
+                    results_placeholder.info("Führe generierten Workflow aus...")
 
-                final_agents_config = validated_cfg; st.success(f"✅ Workflow ({len(final_agents_config)} Agenten) generiert!");
-                st.sidebar.subheader("Dynamisch generierte Agenten:"); summary = [{"R": a.get("round"), "Name": a.get("name"), "Desc": a.get("description", "-")} for a in final_agents_config]
-                st.sidebar.dataframe(summary, use_container_width=True, hide_index=True, column_config={"R": st.column_config.NumberColumn(width="small"), "Name": "Name", "Desc": "Info"}) # Original
-                with st.sidebar.expander("Generierte JSON"): st.json(final_agents_config)
-                results_placeholder.info("Führe generierten Workflow aus...")
-
-        # --- Phase 2: Ausführung ---
+        # --- Phase 2: Ausführung (Normaler Modus) ---
         else:
             config_to_validate = load_agent_config(agent_config_file_path)
-            if config_to_validate: final_agents_config = validate_config_list(config_to_validate, f"'{agent_config_file_path}'")
-            if not final_agents_config: st.error(f"Vordefinierte Konfig für '{selected_workflow_name}' ungültig/nicht geladen."); st.stop()
+            if config_to_validate:
+                final_agents_config = validate_config_list(config_to_validate, f"'{agent_config_file_path}'")
+            if final_agents_config is None:
+                st.error(f"Vordefinierte Konfig für '{selected_workflow_name}' ungültig/nicht geladen.")
+                st.stop()
             results_placeholder.info(f"Führe Workflow '{selected_workflow_name}' aus...")
 
-        # --- Haupt-Agenten-Schleife ---
+        # --- Haupt-Agenten-Ausführung ---
         if final_agents_config:
-            overall_success = True
-            try: client = genai.Client(api_key=API_KEY) # Client Init aus Original
-            except Exception as e: st.error(f"❌ Client Init Fehler: {e}"); st.stop()
-
-            with st.spinner("⏳ Agenten arbeiten..."):
+            with st.spinner(f"Agenten arbeiten..."):
                 try:
+                    client = genai.Client(api_key=api_key)
+                    overall_success = True
                     for agent_index, agent_conf in enumerate(final_agents_config):
-                        # Variablenzuweisung
-                        agent_name = agent_conf.get("name", f"Agent_{agent_index+1}"); round_ = agent_conf.get("round", "N/A")
-                        system_instruction = agent_conf.get("system_instruction", "-"); temperature = agent_conf.get("temperature")
-                        enable_web_search = agent_conf.get("enable_web_search", False); receives_from = agent_conf.get("receives_messages_from", [])
-                        accepts_files = agent_conf.get("accepts_files", False); callable_tool_names = agent_conf.get("callable_tools", [])
-                        results_placeholder.info(f"🧠 Agent: **{agent_name}** (R{round_}, {agent_index+1}/{len(final_agents_config)})...")
+                        agent_name = agent_conf.get("name", f"Agent_{agent_index+1}")
+                        system_instruction = agent_conf.get("system_instruction", "-")
+                        enable_web_search = agent_conf.get("enable_web_search", False)
+                        temperature = agent_conf.get("temperature")
+                        receives_from = agent_conf.get("receives_messages_from", [])
+                        accepts_files = agent_conf.get("accepts_files", False)
+                        callable_tool_names = agent_conf.get("callable_tools", [])
+                        results_placeholder.info(f"🧠 Agent: **{agent_name}** ({agent_index + 1}/{len(final_agents_config)})...")
                         all_sources_found = True
 
-                        # 1. Input (aus Original)
-                        current_input_parts: List[Part] = [Part(text=f"System Anweisung ({selected_workflow_name} - Rolle: {agent_name}):\n{system_instruction}\n---")]
-                        is_first_relevant_agent = not receives_from or all(src not in st.session_state.message_store for src in receives_from)
+                        # 1. Input vorbereiten
+                        current_input_parts: List[Part] = []
+                        current_input_parts.append(Part(text=f"System Anweisung ({selected_workflow_name} - Rolle: {agent_name}):\n{system_instruction}\n---"))
+                        is_first_relevant_agent = not receives_from or all(source not in st.session_state.message_store for source in receives_from)
                         if is_first_relevant_agent:
-                            current_input_parts.append(Part(text=f"Nutzeranfrage:\n{prompt_exec}"))
+                            current_input_parts.append(Part(text=f"Nutzeranfrage:\n{prompt_for_execution}"))
                             if accepts_files and st.session_state.uploaded_files_data:
                                 current_input_parts.append(Part(text="\n\n--- START KONTEXT DATEIEN ---"))
-                                for fd in st.session_state.uploaded_files_data:
-                                    fn, ft, fb = fd["name"], fd["type"], fd["bytes"]
-                                    if ft.startswith("image/"):
-                                        try: image_part = Part(inline_data={"mime_type": ft, "data": fb}); current_input_parts.extend([Part(text=f"\nBild: `{fn}`"), image_part])
-                                        except Exception as e: st.warning(f"{agent_name}: Bild '{fn}' Fehler: {e}")
+                                for file_data in st.session_state.uploaded_files_data:
+                                    file_name, file_type, file_bytes = file_data["name"], file_data["type"], file_data["bytes"]
+                                    if file_type.startswith("image/"):
+                                        image_part = Part(inline_data={"mime_type": file_type, "data": file_bytes})
+                                        current_input_parts.append(Part(text=f"\nBild: `{file_name}`"))
+                                        current_input_parts.append(image_part)
                                     else:
-                                        try: content = fb.decode('utf-8'); current_input_parts.append(Part(text=f"\n--- START DATEI: `{fn}` ---\n{content}\n--- ENDE DATEI: `{fn}` ---"))
-                                        except Exception as decode_e: st.warning(f"{agent_name}: Datei '{fn}' ({ft}) ignoriert (Decode-Fehler): {decode_e}"); content = "[Inhalt nicht lesbar/dekodierbar]"; current_input_parts.append(Part(text=f"\n--- START DATEI: `{fn}` ---\n{content}\n--- ENDE DATEI: `{fn}` ---"))
+                                        try:
+                                            file_content = file_bytes.decode('utf-8')
+                                        except Exception as decode_e:
+                                            st.warning(f"Datei '{file_name}' ({file_type}) ignoriert (Decode-Fehler): {decode_e}")
+                                            file_content = "[Inhalt nicht lesbar/dekodierbar]"
+                                        file_text_part = Part(text=(f"\n--- START DATEI: `{file_name}` ---\n{file_content}\n--- ENDE DATEI: `{file_name}` ---"))
+                                        current_input_parts.append(file_text_part)
                                 current_input_parts.append(Part(text="\n--- ENDE KONTEXT DATEIEN ---"))
                         else:
                             previous_outputs_text = []
-                            for src in receives_from:
-                                if src in st.session_state.message_store: previous_outputs_text.append(f"Ergebnis '{src}':\n{st.session_state.message_store[src]}")
+                            for source_agent_name in receives_from:
+                                if source_agent_name in st.session_state.message_store:
+                                    previous_outputs_text.append(f"Ergebnis '{source_agent_name}':\n{st.session_state.message_store[source_agent_name]}")
                                 else:
-                                    err = f"Input von '{src}' fehlt! Überspringe '{agent_name}'."; st.warning(err)
-                                    st.session_state.agent_results_display.append({"agent": agent_name, "status": "Übersprungen", "output": "[Input fehlt]", "details": err}); all_sources_found = False; break
-                            if not all_sources_found: overall_success = False; continue
+                                    error_msg = f"Input von '{source_agent_name}' fehlt. Überspringe '{agent_name}'."
+                                    st.warning(error_msg)
+                                    st.session_state.agent_results_display.append({"agent": agent_name, "status": "Übersprungen", "details": error_msg, "output": "[Input fehlt]"})
+                                    all_sources_found = False
+                                    break
+                            if not all_sources_found:
+                                overall_success = False
+                                continue
                             input_from_previous = "\n\n---\n\n".join(previous_outputs_text)
                             current_input_parts.append(Part(text=f"Vorherige Ergebnisse:\n{input_from_previous}\n---\nDeine Aufgabe:"))
 
-                        # 2. Tools
+                        # 2. Konfiguration der Tools
                         agent_tools_list = []
                         current_agent_func_declarations = []
                         if enable_web_search:
-                            try: agent_tools_list.append(Tool(google_search=GoogleSearch()))
-                            except Exception as e: st.error(f"{agent_name}: Google Search Init Fehler: {e}")
+                            agent_tools_list.append(Tool(google_search=GoogleSearch()))
                         if callable_tool_names:
-                            for tn in callable_tool_names:
-                                if tn in AVAILABLE_TOOLS:
-                                    f = AVAILABLE_TOOLS[tn]; desc = f.__doc__.splitlines()[0] if f.__doc__ else f"Tool: {tn}"
-                                    schema = {}
-                                    if tn == "calculator": schema = {"type": "OBJECT", "properties": {"expression": {"type": "STRING"}}, "required": ["expression"]}
-                                    elif tn == "get_current_datetime": schema = {"type": "OBJECT", "properties": {}}                                
-                                    current_agent_func_declarations.append(FunctionDeclaration(name=tn, description=desc, parameters=schema))
-                                else: st.warning(f"Tool '{tn}' für '{agent_name}' nicht in AVAILABLE_TOOLS.")
-                            if current_agent_func_declarations: agent_tools_list.append(Tool(function_declarations=current_agent_func_declarations))
+                            for tool_name in callable_tool_names:
+                                if tool_name in AVAILABLE_TOOLS:
+                                    func = AVAILABLE_TOOLS[tool_name]
+                                    description = func.__doc__.splitlines()[0] if func.__doc__ else f"Tool: {tool_name}"
+                                    params_schema = {}
+                                    if tool_name == "calculator":
+                                        params_schema = {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}
+                                    elif tool_name == "get_current_datetime":
+                                        params_schema = {"type": "object", "properties": {}}
+                                    current_agent_func_declarations.append(FunctionDeclaration(name=tool_name, description=description, parameters=params_schema))
+                                else:
+                                    st.warning(f"Tool '{tool_name}' für '{agent_name}' nicht in AVAILABLE_TOOLS.")
+                            if current_agent_func_declarations:
+                                agent_tools_list.append(Tool(function_declarations=current_agent_func_declarations))
+                        gen_config_args = {"response_modalities": ["TEXT"]}
+                        if agent_tools_list:
+                            gen_config_args["tools"] = agent_tools_list
+                        if temperature is not None:
+                            gen_config_args["temperature"] = temperature
+                        agent_specific_config = GenerateContentConfig(**gen_config_args)
 
-                        # 3. Config 
-                        gen_cfg_args = {"response_modalities": ["TEXT"]}
-                        if agent_tools_list: gen_cfg_args["tools"] = agent_tools_list
-                        if temperature is not None: gen_cfg_args["temperature"] = temperature
-                        agent_specific_config = GenerateContentConfig(**gen_cfg_args)
-
-                        # 4. API Loop mit Anpassung für limited_generate_content)
-                        max_function_calls = 5 
-                        call_count = 0; final_agent_output = ""; agent_success_flag = False; grounding_info = None
+                        # 3. API-Aufruf / Function Calling Loop
+                        max_function_calls = 5
+                        call_count = 0
+                        final_agent_output = ""
+                        agent_success_flag = False
+                        grounding_info = None
                         conversation_history = list(current_input_parts)
-                        should_skip = (agent_conf.get("name", "").startswith("Planner") and accepts_files and not st.session_state.uploaded_files_data and not question.strip()) # Aus Original
+                        should_skip = (agent_conf.get("name", "").startswith("Planner") and accepts_files and not st.session_state.uploaded_files_data and not question.strip())
 
                         while call_count < max_function_calls:
-                            if should_skip: 
+                            if should_skip:
                                 st.info(f"'{agent_name}' übersprungen.")
                                 st.session_state.agent_results_display.append({"agent": agent_name, "status": "Übersprungen", "output": "[Keine Frage/Dateien]"})
-                                agent_success_flag = True; final_agent_output = "[Keine Frage/Dateien]"
+                                agent_success_flag = True
+                                final_agent_output = "[Keine Frage/Dateien]"
                                 break
                             try:
                                 effective_model_for_call = f"models/{model_id}"
-                                # === Verwende limited_generate_content ===
                                 response = limited_generate_content(
                                     client=client,
                                     model=effective_model_for_call,
                                     contents=conversation_history,
                                     config=agent_specific_config
                                 )
-                                # === ENDE ANPASSUNG ===
                                 candidate = response.candidates[0] if response.candidates else None
                                 function_call = None
                                 if candidate and hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') and candidate.content.parts:
                                     first_part = candidate.content.parts[0]
-                                    if hasattr(first_part, 'function_call'): function_call = first_part.function_call
-                                if function_call and hasattr(function_call, 'name'): # Handling
-                                    tool_name = function_call.name; tool_args = dict(function_call.args) if hasattr(function_call, 'args') else {}
+                                if hasattr(first_part, 'function_call'):
+                                    function_call = first_part.function_call
+                                if function_call and hasattr(function_call, 'name'):
+                                    tool_name = function_call.name
+                                    tool_args = dict(function_call.args) if hasattr(function_call, 'args') else {}
                                     st.info(f"'{agent_name}' -> Tool `{tool_name}`...")
                                     if tool_name in AVAILABLE_TOOLS:
                                         tool_function = AVAILABLE_TOOLS[tool_name]
                                         try:
-                                            function_result = tool_function(**tool_args); st.success(f"Tool `{tool_name}` OK.")
+                                            function_result = tool_function(**tool_args)
+                                            st.success(f"Tool `{tool_name}` OK.")
                                             function_response_part = Part(function_response=FunctionResponse(name=tool_name, response={"content": str(function_result)}))
-                                            conversation_history.append(first_part); conversation_history.append(function_response_part); call_count += 1; continue
-                                        except Exception as func_exc: st.error(f"Tool `{tool_name}` Fehler: {func_exc}"); final_agent_output = f"[Tool Fehler {tool_name}: {func_exc}]"; agent_success_flag = False; break
-                                    else: st.error(f"Unbekanntes Tool `{tool_name}`"); final_agent_output = f"[Unbekanntes Tool {tool_name}]"; agent_success_flag = False; break
-                                else: # Text Handling
+                                            conversation_history.append(first_part)
+                                            conversation_history.append(function_response_part)
+                                            call_count += 1
+                                            continue
+                                        except Exception as func_exc:
+                                            st.error(f"Tool `{tool_name}` Fehler: {func_exc}")
+                                            final_agent_output = f"[Tool Fehler {tool_name}: {func_exc}]"
+                                            agent_success_flag = False
+                                            break
+                                    else:
+                                        st.error(f"Unbekanntes Tool `{tool_name}`")
+                                        final_agent_output = f"[Unbekanntes Tool {tool_name}]"
+                                        agent_success_flag = False
+                                        break
+                                else:
                                     if candidate and hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts') and candidate.content.parts:
                                         text_parts = [part.text for part in candidate.content.parts if hasattr(part, 'text')]
-                                        if text_parts: final_agent_output = "\n".join(text_parts).strip(); grounding_info = get_grounding_info(candidate); agent_success_flag = True
+                                        if text_parts:
+                                            final_agent_output = "\n".join(text_parts).strip()
+                                            grounding_info = get_grounding_info(candidate)
+                                            agent_success_flag = True
                                         else:
-                                            feedback = getattr(response, 'prompt_feedback', None); block_reason = getattr(feedback, 'block_reason', "?"); block_msg = getattr(feedback, 'block_reason_message', "?")
-                                            final_agent_output = f"[Fehler: Keine gültige Antwort. Grund: {block_reason}. Nachricht: {block_msg}]"; st.error(f"'{agent_name}': {final_agent_output}"); agent_success_flag = False
+                                            feedback = getattr(response, 'prompt_feedback', None)
+                                            block_reason = getattr(feedback, 'block_reason', "Unbekannt") if feedback else "Unbekannt"
+                                            block_msg = getattr(feedback, 'block_reason_message', "Keine Details") if feedback else "Keine Details"
+                                            final_agent_output = f"[Fehler: Keine gültige Antwort. Grund: {block_reason}. Nachricht: {block_msg}]"
+                                            st.error(f"'{agent_name}': {final_agent_output}")
+                                            agent_success_flag = False
                                     else:
-                                        feedback = getattr(response, 'prompt_feedback', None); block_reason = getattr(feedback, 'block_reason', "?"); block_msg = getattr(feedback, 'block_reason_message', "?")
-                                        final_agent_output = f"[Fehler: Keine gültige Antwortstruktur. Grund: {block_reason}. Nachricht: {block_msg}]"; st.error(f"'{agent_name}': {final_agent_output}"); agent_success_flag = False
+                                        feedback = getattr(response, 'prompt_feedback', None)
+                                        block_reason = getattr(feedback, 'block_reason', "Unbekannt") if feedback else "Unbekannt"
+                                        block_msg = getattr(feedback, 'block_reason_message', "Keine Details") if feedback else "Keine Details"
+                                        final_agent_output = f"[Fehler: Keine gültige Antwort. Grund: {block_reason}. Nachricht: {block_msg}]"
+                                        st.error(f"'{agent_name}': {final_agent_output}")
+                                        agent_success_flag = False
                                     break
-                            # Allgemeine Fehlerbehandlung 
                             except Exception as e:
                                 st.error(f"❌ Kritischer Fehler bei '{agent_name}': {e}")
                                 st.error(traceback.format_exc())
                                 final_agent_output = f"[Kritischer Fehler: {e}]"
                                 agent_success_flag = False
                                 overall_success = False
-                                break # Breche while Schleife für diesen Agenten ab
+                                break
 
-                        # Nach der While-Schleife
                         if call_count >= max_function_calls:
                             st.warning(f"Agent '{agent_name}' hat Limit für Funktionsaufrufe ({max_function_calls}) erreicht.")
-                            if not final_agent_output: final_agent_output = "[Limit erreicht]"
+                            if not final_agent_output:
+                                final_agent_output = "[Limit erreicht]"
                             agent_success_flag = False
 
-                        # Ergebnis speichern
                         if final_agent_output:
-                            if agent_success_flag and "[Keine Frage/Dateien]" not in final_agent_output: st.session_state.message_store[agent_name] = final_agent_output
-                            already_skipped = any(r['agent'] == agent_name and r['status'] == 'Übersprungen' and "[Input fehlt]" in r.get('output','') for r in st.session_state.agent_results_display)
+                            if agent_success_flag and "[Keine Frage/Dateien]" not in final_agent_output:
+                                st.session_state.message_store[agent_name] = final_agent_output
+                            already_skipped = any(r['agent'] == agent_name and r['status'] == 'Übersprungen' and "[Fehlender Input]" in r.get('output','') for r in st.session_state.agent_results_display)
                             if not already_skipped:
                                 current_status = "Erfolgreich" if agent_success_flag else "Fehlgeschlagen"
-                                if "[Übersprungen" in final_agent_output or "[Keine Frage/Dateien]" in final_agent_output: current_status = "Übersprungen"
-                                # Original hatte keine Warnung
-                                st.session_state.agent_results_display.append({"agent": agent_name, "status": current_status, "output": final_agent_output, "sources": grounding_info, "details": None })
-                        if not agent_success_flag and not (should_skip or "[Keine Frage/Dateien]" in final_agent_output): overall_success = False
+                                if "[Übersprungen" in final_agent_output or "[Keine Frage/Dateien]" in final_agent_output:
+                                    current_status = "Übersprungen"
+                                st.session_state.agent_results_display.append({
+                                    "agent": agent_name,
+                                    "status": current_status,
+                                    "output": final_agent_output,
+                                    "sources": grounding_info,
+                                    "details": None
+                                })
+                        if not agent_success_flag and not (should_skip or "[Keine Frage/Dateien]" in final_agent_output):
+                            overall_success = False
 
-                # Exception Handling für die gesamte Agenten-Schleife
-                except Exception as e: st.error(f"❌ Unerwarteter Fehler im Hauptprozess: {e}"); st.error(traceback.format_exc()); overall_success = False
-            # Ende with spinner
+                except Exception as e:
+                     st.error(f"❌ Unerwarteter Fehler im Hauptprozess: {e}")
+                     st.error(traceback.format_exc())
+                     overall_success = False
 
-            # --- Finale Statusmeldung & Ergebnisse ---
-            results_placeholder.empty(); st.markdown("---")
-            if not st.session_state.agent_results_display: st.warning("Keine Agenten ausgeführt.")
-            elif overall_success: st.success("✅ Workflow erfolgreich abgeschlossen.")
-            else: st.error("❌ Workflow mit Fehlern/Warnungen abgeschlossen.")
+            results_placeholder.empty()
+            st.markdown("---")
+            if not st.session_state.agent_results_display:
+                st.warning("Keine Agenten ausgeführt.")
+            elif overall_success:
+                st.success("✅ Workflow erfolgreich abgeschlossen.")
+            else:
+                st.error("❌ Workflow mit Fehlern/Warnungen abgeschlossen.")
 
             st.subheader("Ergebnisse der einzelnen Agenten:")
-            displayed = set() 
+            displayed_agents = set()
             for result in st.session_state.agent_results_display:
-                name = result.get('agent', 'Unbekannter Agent'); status = result.get('status', 'Unbekannt')
-                if name in displayed: continue; displayed.add(name)
-                out = result.get('output', '[Kein Output]'); src = result.get('sources'); det = result.get('details')
-                icons = {'Erfolgreich': '✅', 'Fehlgeschlagen': '❌', 'Übersprungen': '⚠️', 'Warnung': '⚠️'}
-                icon = icons.get(status, '❓')
-                with st.expander(f"{icon} Agent: **{name}** ({status})", expanded=(status != 'Übersprungen')):
+                agent_name = result.get('agent', 'Unbekannter Agent')
+                if agent_name in displayed_agents:
+                    continue
+                displayed_agents.add(agent_name)
+                status = result.get('status', 'Unbekannt')
+                output = result.get('output', '[Kein Output]')
+                sources = result.get('sources')
+                details = result.get('details')
+                status_icon = '❓'
+                if status == 'Erfolgreich':
+                    status_icon = '✅'
+                elif status == 'Fehlgeschlagen':
+                    status_icon = '❌'
+                elif status in ['Warnung', 'Übersprungen']:
+                    status_icon = '⚠️'
+                expander_title = f"{status_icon} Agent: **{agent_name}** ({status})"
+                expand_default = (status != 'Übersprungen')
+                with st.expander(expander_title, expanded=expand_default):
                     st.markdown("##### Output:")
-                    gen_name = gen_agent_conf['name'] if is_generator_mode and gen_agent_conf else "___"
-                    is_gen = name == gen_name
-                    is_code = "```" in out or (status == 'Erfolgreich' and any(kw in name.lower() for kw in ["coder", "architect", "refiner"]))
-                    if is_gen and status == 'Erfolgreich': st.code(out, language="json")
-                    elif is_code and status == 'Erfolgreich':
-                        lang_match = re.search(r"```(\w+)", out); lang_name = selected_workflow_name.split()[0].lower().replace("plugin", "python"); lang = lang_match.group(1) if lang_match else lang_name
-                        code_content = re.sub(r"```\w*\n?", "", out, count=1); code_content = re.sub(r"\n?```$", "", code_content)
+                    is_likely_code_output = "```" in output or (status == 'Erfolgreich' and any(kw in agent_name.lower() for kw in ["coder", "architect", "refiner"]))
+                    if agent_name == "WorkflowGenerator" and status == 'Erfolgreich':
+                        st.code(output, language="json")
+                    elif is_likely_code_output and status == 'Erfolgreich':
+                        lang_match = re.search(r"```(\w+)", output)
+                        lang_name = selected_workflow_name.split()[0].lower().replace("plugin", "python")
+                        lang = lang_match.group(1) if lang_match else lang_name
+                        code_content = re.sub(r"```\w*\n?", "", output, count=1)
+                        code_content = re.sub(r"\n?```$", "", code_content)
                         st.code(code_content.strip(), language=lang, line_numbers=True)
-                    else: st.markdown(out)
-                    if src: st.markdown("##### Quellen/Infos:"); st.caption(f"{src}")
-                    if det: st.info(f"Details: {det}")
+                    else:
+                        st.markdown(output)
+                    if sources:
+                        st.markdown("##### Quellen/Infos:")
+                        st.caption(f"{sources}")
+                    if details:
+                        st.info(f"Details: {details}")
 
-            # --- Download ---
-            st.markdown("---"); st.subheader("📦 Download generierter Dateien")
-            files = {}
-            pattern = re.compile(r"## FILE: \s*([\w\.\-\/]+\.\w+)\s*\n```(?:[\w\+\#\-\.]*\n)?(.*?)```", re.DOTALL | re.MULTILINE)
-            gen_name_to_exclude = gen_agent_conf['name'] if is_generator_mode and gen_agent_conf else "___"
-            for r in st.session_state.agent_results_display:
-                if r.get("agent") != "WorkflowGenerator" and r.get("status") == "Erfolgreich" and r.get("output"): # Original Bedingung
-                    for fn, c in pattern.findall(r["output"]): files[fn.strip()] = c.strip() + "\n"
-            if files:
-                st.write(f"Generierte Dateien für **'{selected_workflow_name}'**:"); st.markdown("\n".join([f"- `{fname}`" for fname in sorted(files.keys())]))
-                buf = io.BytesIO()
+            st.markdown("---")
+            st.subheader("📦 Download generierter Dateien")
+            project_files = {}
+            file_pattern = re.compile(r"## FILE: \s*([\w\.\-\/]+\.\w+)\s*\n```(?:[\w\+\#\-\.]*\n)?(.*?)```", re.DOTALL | re.MULTILINE)
+            for result in st.session_state.agent_results_display:
+                if result.get("agent") != "WorkflowGenerator" and result.get("status") == "Erfolgreich" and result.get("output"):
+                    matches = file_pattern.findall(result["output"])
+                    for filename, content in matches:
+                        project_files[filename.strip()] = content.strip() + "\n"
+            if project_files:
+                st.write(f"Generierte Dateien für **'{selected_workflow_name}'**:")
+                st.markdown("\n".join([f"- `{fname}`" for fname in sorted(project_files.keys())]))
+                zip_buffer = io.BytesIO()
                 try:
-                    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-                        for fn, c in files.items(): zf.writestr(fn, c.encode('utf-8'))
-                    dl_fn = f"{selected_workflow_name.lower().replace(' ','_')}_output_{datetime.datetime.now():%Y%m%d_%H%M}.zip"
-                    st.download_button(label=f"⬇️ '{selected_workflow_name}' Ergebnisse als ZIP", data=buf.getvalue(), file_name=dl_fn, mime="application/zip", key="dl_zip")
-                except Exception as e: st.error(f"❌ ZIP Fehler: {e}"); st.error(traceback.format_exc())
-            else: st.info("Keine Dateien zum Zippen gefunden.")
+                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_f:
+                        for filename, content in project_files.items():
+                            zip_f.writestr(filename, content.encode('utf-8'))
+                    zip_bytes = zip_buffer.getvalue()
+                    download_filename = f"{selected_workflow_name.lower().replace(' ','_')}_output_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.zip"
+                    st.download_button(label=f"⬇️ '{selected_workflow_name}' Ergebnisse als ZIP", data=zip_bytes, file_name=download_filename, mime="application/zip", key="download_zip_button")
+                except Exception as zip_e:
+                    st.error(f"Fehler beim Zippen: {zip_e}")
+                    st.error(traceback.format_exc())
+            else:
+                st.info("Keine Dateien zum Zippen gefunden.")
 
-            # --- Finales Ergebnis ---
-            st.markdown("---"); st.subheader("🏁 Finales Text-Ergebnis")
-            final_out = "[Kein spezifisches textuelles Endergebnis gefunden]"; final_name = None
-            for r in reversed(st.session_state.agent_results_display):
-                agent, out, status = r.get('agent'), r.get('output', ''), r.get('status')
-                is_gen = is_generator_mode and gen_agent_conf and agent == gen_agent_conf['name']
-                if status == "Erfolgreich" and not is_gen and out and "[Kein Output]" not in out and "[Keine Frage/Dateien]" not in out:
-                    is_likely_just_files = pattern.fullmatch(out.strip()) is not None or out.strip().startswith("## FILE:")
+            st.markdown("---")
+            st.subheader("🏁 Finales Text-Ergebnis")
+            final_successful_output = "[Kein spezifisches textuelles Endergebnis gefunden]"
+            final_agent_name = None
+            for res in reversed(st.session_state.agent_results_display):
+                output = res.get("output", "")
+                status = res.get("status")
+                agent = res.get("agent")
+                if agent != "WorkflowGenerator" and status == "Erfolgreich" and output and "[Kein Output]" not in output and "[Keine Frage/Dateien]" not in output:
+                    is_likely_just_files = file_pattern.fullmatch(output.strip()) is not None or output.strip().startswith("## FILE:")
                     if (not is_likely_just_files or any(kw in agent for kw in ["Planner", "Reviewer", "Packager"])):
-                        final_out, final_name = out, agent; break
-                    elif final_name is None: final_out, final_name = f"[Letzter Output war Code von Agent '{agent}']", agent
-            st.markdown(f"**(von Agent: **{final_name}**)**" if final_name else "")
-            if "[Letzter Output war Code von Agent" in final_out: st.info(final_out)
-            else: st.markdown(final_out)
+                        final_successful_output = output
+                        final_agent_name = agent
+                        break
+                    elif final_agent_name is None:
+                        final_successful_output = f"[Letzter Output war Code von Agent '{agent}']"
+                        final_agent_name = agent
+            final_title_suffix = f"(von Agent: **{final_agent_name}**)" if final_agent_name else ""
+            st.markdown(f"**{final_title_suffix}**")
+            if "[Letzter Output war Code von Agent" in final_successful_output:
+                st.info(final_successful_output)
+            else:
+                st.markdown(final_successful_output)
 
 # --- Hauptausführungspunkt ---
 if __name__ == "__main__":
