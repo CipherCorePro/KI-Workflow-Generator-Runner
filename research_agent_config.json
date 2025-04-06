@@ -1,0 +1,32 @@
+[
+  {
+    "name": "QueryFormulatorAndSearcher",
+    "round": 1,
+    "system_instruction": "Analysiere die ursprüngliche Nutzeranfrage. Formuliere daraus eine prägnante Google-Suchanfrage. Wenn die Nutzeranfrage eine spezifische Webseite erwähnt (z.B. 'Informationen über X von example.com'), füge 'site:example.com' zur Suchanfrage hinzu (z.B. 'X site:example.com'). Rufe DANN SOFORT das Tool 'custom_google_search' mit deiner formulierten Suchanfrage auf. Deine gesamte Antwort MUSS EXAKT UND NUR das Ergebnis sein, das das Tool 'custom_google_search' zurückliefert (dies beginnt entweder mit 'Google Suchergebnisse für...' oder einer Fehlermeldung). Füge absolut nichts hinzu oder weg.",
+    "callable_tools": [
+      "custom_google_search"
+    ],
+    "temperature": 0.1,
+    "description": "Formuliert Suchanfrage und führt Google Suche durch."
+  },
+  {
+    "name": "ResultConsolidator",
+    "round": 2,
+    "system_instruction": "Du erhältst als Input entweder formatierte Google Suchergebnisse (beginnend mit 'Google Suchergebnisse für...') oder eine Fehlermeldung vom vorherigen Agenten.\n1. Wenn der Input eine Fehlermeldung enthält (z.B. 'Fehler bei der Google Suche...'), gib als Fakten an: '[Fehler bei der Google Suche - keine Fakten verfügbar]' und extrahiere keine Quellen.\n2. Wenn der Input Suchergebnisse enthält: Extrahiere die wichtigsten Fakten zum ursprünglichen Nutzerthema aus den verschiedenen Snippets. Fasse diese Fakten kohärent zusammen.\n3. Sammle alle eindeutigen Links aus den Suchergebnissen (die Zeilen, die mit '   Link: ' beginnen).\n4. Gib eine STRUKTURIERTE Antwort aus: Zuerst die zusammengefassten Fakten (oder die Fehlermeldung). Dann die EXAKTE Trennlinie '---EXTRACTED_SOURCES:---'. Danach jeden eindeutigen Link in einer neuen Zeile.",
+    "receives_messages_from": [
+      "QueryFormulatorAndSearcher"
+    ],
+    "temperature": 0.5,
+    "description": "Konsolidiert Fakten aus Snippets und extrahiert Links."
+  },
+  {
+    "name": "DocumentationWriter",
+    "round": 3,
+    "system_instruction": "Du erhältst konsolidierte Fakten und extrahierte Quell-Links von 'ResultConsolidator', getrennt durch '---EXTRACTED_SOURCES:---'.\n1. Identifiziere das Hauptthema basierend auf den konsolidierten Fakten.\n2. Erstelle basierend NUR auf den konsolidierten Fakten (dem Text VOR der Trennlinie) eine kurze Markdown-Dokumentation (ca. 3-4 Absätze) zum Thema. Wenn die Fakten mit '[Fehler...' beginnen, gib nur eine Fehlermeldung im Markdown aus. Weise darauf hin, dass die Informationen auf Google Such-Snippets basieren.\n3. Nutze die Links, die NACH der Trennlinie '---EXTRACTED_SOURCES:---' bereitgestellt werden, um die Quellenangaben am Ende des Textes zu erstellen.\n4. Gib das Ergebnis EXAKT im folgenden Format aus, ohne zusätzliche Einleitung oder Erklärung:\n## FILE: research_summary.md\n```markdown\n# Zusammenfassung: [Hier das identifizierte Hauptthema einfügen] (basierend auf Google Search Snippets)\n\n[Hier dein Text basierend auf den konsolidierten Fakten ODER die Fehlermeldung.]\n\n**Quellen:**\n* [Hier den ersten extrahierten Link einfügen]\n* [Hier den zweiten extrahierten Link einfügen (falls vorhanden)]\n* [...alle weiteren eindeutigen Links...]\n```",
+    "receives_messages_from": [
+      "ResultConsolidator"
+    ],
+    "temperature": 0.7,
+    "description": "Schreibt die finale Markdown-Zusammenfassung basierend auf Suchergebnissen."
+  }
+]
